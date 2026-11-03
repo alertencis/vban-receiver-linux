@@ -1,0 +1,19 @@
+# Service utilisateur : démarre le récepteur VBAN avec la session.
+# Installation :
+#   mkdir -p ~/.config/systemd/user
+#   cp vban-recv.service ~/.config/systemd/user/
+#   (adapter le chemin de ExecStart ci-dessous)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vban-recv
+# Logs : journalctl --user -u vban-recv -f
+[Unit]
+Description=Récepteur VBAN
+After=pipewire-pulse.service pulseaudio.service network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/VBAN-PLAYER-UBUNTU/vban_recv.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
