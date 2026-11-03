@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Réglages locaux (générés par les interfaces)
+vban_recv.json
+vban.json

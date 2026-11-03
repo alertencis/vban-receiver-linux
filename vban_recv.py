@@ -4,12 +4,15 @@
 Lancer :  python3 vban_recv.py
 Ouvrir :  http://IP_DU_PC:8096   (réglage des récepteurs : nom, port, IP, flux, sortie)
 
+Documentation : README.md. Licence MIT.
+
 Aucune dépendance Python. Le son est joué par `pacat` (paquet pulseaudio-utils,
 présent par défaut) ou, à défaut, par `aplay` (alsa-utils).
-Chaque récepteur apparaît comme une application dans le mixeur (mixer.py / pavucontrol).
+Chaque récepteur apparaît comme une application dans le mixeur du système (pavucontrol).
 Réglages enregistrés dans vban_recv.json, à côté du script.
 """
 import argparse
+from array import array
 import ipaddress
 import json
 import os
@@ -145,6 +148,25 @@ def parse(packet):
     return stream, (SAMPLE_RATES[sr], channels, dtype), frame, pcm
 
 
+def peak_level(dtype, pcm):
+    """Crête 0..1 d'un paquet (un échantillon sur 4, pour le vumètre)."""
+    if dtype == 0:
+        a, zero, full = array("B", pcm), 128, 128.0
+    elif dtype == 1:
+        a, zero, full = array("h", pcm), 0, 32768.0
+    elif dtype == 2:       # 24 bits : l'octet de poids fort suffit
+        a, zero, full = array("b", pcm[2::3]), 0, 128.0
+    elif dtype == 3:
+        a, zero, full = array("i", pcm), 0, 2147483648.0
+    else:
+        a, zero, full = array("f", pcm), 0, 1.0
+    a = a[::4]
+    if not a:
+        return 0.0
+    peak = max(abs(x - zero) for x in a) / full
+    return peak if peak < 1.0 else 1.0
+
+
 class Player:
     """Processus pacat/aplay alimenté en PCM brut sur stdin."""
 
@@ -221,6 +243,8 @@ class Receiver:
         self.last_frame = None
         self.last_rx = 0.0
         self.fmt = None
+        self.peak = 0.0
+        self.peak_t = 0.0
 
     def accepts(self, ip, stream):
         c = self.cfg
@@ -241,6 +265,11 @@ class Receiver:
         self.last_frame = frame
         self.last_rx = now
         self.fmt = fmt
+        p = peak_level(fmt[2], pcm)
+        if now - self.peak_t > 0.3:
+            self.peak, self.peak_t = p, now
+        elif p > self.peak:
+            self.peak = p
         self.player.write(fmt, pcm)
 
     def idle(self, now):
@@ -259,6 +288,7 @@ class Receiver:
             "state": "ok",
             "text": "%s depuis %s · %s · %d perdus"
                     % (stream, ip, fmt_text(self.fmt), self.lost),
+            "level": self.peak if time.time() - self.peak_t < 0.6 else 0.0,
         }
 
 
@@ -371,156 +401,288 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Récepteur VBAN</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%2338bdf8'/%3E%3Cpath d='M5 12h2l2-5 3 10 3-8 2 3h2' fill='none' stroke='%23062030' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
-  :root { --bg:#14161a; --card:#1f232a; --fg:#e8eaed; --dim:#8b93a1; --acc:#4da3ff; --red:#e5484d; }
+  :root {
+    --bg:#0d1117; --bg2:#121821; --card:#161d27; --card2:#1c2531; --line:#263142;
+    --fg:#e6edf3; --dim:#8b98a9; --acc:#38bdf8; --acc2:#818cf8;
+    --ok:#3fb950; --wait:#f0b429; --err:#f85149; --r:14px;
+  }
   * { box-sizing:border-box; }
-  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px system-ui,sans-serif; }
-  h1 { font-size:18px; margin:0 0 12px; }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:22px 0 8px; }
-  .card { background:var(--card); border-radius:10px; padding:12px; overflow-x:auto; }
-  table { border-collapse:collapse; width:100%; }
-  th { text-align:left; font-weight:500; color:var(--dim); font-size:12px; padding:4px 6px; white-space:nowrap; }
-  td { padding:4px 6px; vertical-align:middle; }
-  input, select { background:#2b3039; color:var(--fg); border:0; border-radius:6px; padding:6px; min-width:0; font:inherit; }
-  input[type=checkbox] { accent-color:var(--acc); width:18px; height:18px; }
-  button { background:#2b3039; color:var(--fg); border:0; border-radius:6px; padding:6px 10px; cursor:pointer; font:inherit; }
-  button.main { background:var(--acc); color:#000; }
-  .st { display:flex; align-items:center; gap:6px; color:var(--dim); font-size:13px; min-width:16em; }
-  .dot { flex:none; width:10px; height:10px; border-radius:50%; background:#555; }
-  .dot.ok { background:#3fb950; } .dot.wait { background:#f0b429; } .dot.error { background:var(--red); }
-  .msg { color:var(--dim); margin-left:8px; }
-  .bar { margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .seen { display:flex; gap:10px; align-items:center; padding:6px 0; border-bottom:1px solid #2b3039; }
-  .seen:last-child { border:0; }
-  .empty { color:var(--dim); }
-  .hint { color:var(--dim); font-size:13px; margin-top:8px; }
+  html { color-scheme:dark; }
+  body {
+    margin:0; min-height:100vh; color:var(--fg); font:15px/1.45 system-ui,-apple-system,"Segoe UI",Ubuntu,sans-serif;
+    background:radial-gradient(1200px 500px at 10% -10%, #17324a 0%, transparent 60%),
+               radial-gradient(900px 400px at 100% 0%, #241f4a 0%, transparent 55%), var(--bg);
+  }
+  .wrap { max-width:1180px; margin:0 auto; padding:28px 20px 120px; }
+
+  header { display:flex; align-items:center; gap:14px; margin-bottom:26px; flex-wrap:wrap; }
+  .logo { width:44px; height:44px; border-radius:12px; display:grid; place-items:center;
+          background:linear-gradient(135deg,var(--acc),var(--acc2)); box-shadow:0 6px 24px #38bdf833; }
+  .logo svg { width:26px; height:26px; }
+  h1 { font-size:22px; margin:0; letter-spacing:-.01em; }
+  .sub { color:var(--dim); font-size:13px; }
+  .pills { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
+  .pill { display:flex; align-items:center; gap:7px; background:var(--card); border:1px solid var(--line);
+          border-radius:999px; padding:6px 12px; font-size:13px; color:var(--dim); }
+  .pill b { color:var(--fg); font-weight:600; }
+
+  .section { display:flex; align-items:center; justify-content:space-between; margin:30px 0 12px; gap:12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.12em; color:var(--dim); margin:0; font-weight:600; }
+
+  button { font:inherit; color:var(--fg); background:var(--card2); border:1px solid var(--line);
+           border-radius:10px; padding:8px 14px; cursor:pointer; transition:.15s; }
+  button:hover { border-color:#3a4a60; background:#222d3b; }
+  button.primary { background:linear-gradient(135deg,var(--acc),var(--acc2)); color:#061423; border:0; font-weight:600; }
+  button.primary:hover { filter:brightness(1.08); }
+  button.ghost { background:transparent; }
+  button.icon { padding:6px 9px; background:transparent; border-color:transparent; color:var(--dim); }
+  button.icon:hover { color:var(--err); background:#f8514914; }
+  button:disabled { opacity:.45; cursor:default; }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:16px; }
+  .card { background:linear-gradient(180deg,var(--card),var(--bg2)); border:1px solid var(--line);
+          border-radius:var(--r); padding:16px; box-shadow:0 8px 30px #0006; transition:.2s; }
+  .card.live { border-color:#3fb95055; }
+  .card.off { opacity:.55; }
+
+  .head { display:flex; align-items:center; gap:10px; }
+  input, select { font:inherit; color:var(--fg); background:var(--bg); border:1px solid var(--line);
+                  border-radius:9px; padding:8px 10px; width:100%; min-width:0; transition:.15s; }
+  input:focus, select:focus { outline:0; border-color:var(--acc); box-shadow:0 0 0 3px #38bdf826; }
+  input::placeholder { color:#5b6878; }
+  input.title { font-size:17px; font-weight:600; background:transparent; border-color:transparent; padding:4px 6px; }
+  input.title:hover { border-color:var(--line); }
+
+  .switch { position:relative; flex:none; width:40px; height:22px; cursor:pointer; }
+  .switch input { opacity:0; width:0; height:0; position:absolute; }
+  .switch span { position:absolute; inset:0; background:#2a3443; border-radius:99px; transition:.2s; }
+  .switch span::after { content:""; position:absolute; left:3px; top:3px; width:16px; height:16px;
+                        border-radius:50%; background:#c9d1d9; transition:.2s; }
+  .switch input:checked + span { background:var(--ok); }
+  .switch input:checked + span::after { transform:translateX(18px); background:#fff; }
+
+  .state { display:flex; align-items:center; gap:8px; margin:12px 0 8px; font-size:13px; color:var(--dim); min-height:20px; }
+  .dot { flex:none; width:9px; height:9px; border-radius:50%; background:#4b5563; }
+  .dot.ok { background:var(--ok); box-shadow:0 0 0 4px #3fb95026; animation:pulse 1.6s infinite; }
+  .dot.wait { background:var(--wait); }
+  .dot.error { background:var(--err); }
+  @keyframes pulse { 50% { box-shadow:0 0 0 7px #3fb95000; } }
+
+  .meter { position:relative; height:8px; border-radius:99px; overflow:hidden;
+           background:linear-gradient(90deg,#2ea043 0%,#3fb950 62%,#f0b429 82%,#f85149 100%); }
+  .meter .cover { position:absolute; top:0; right:0; bottom:0; width:100%; background:#0b1018; transition:width .12s linear; }
+
+  .fields { display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; margin-top:14px; }
+  .fld { display:flex; flex-direction:column; gap:5px; font-size:12px; color:var(--dim); }
+  .fld.wide { grid-column:1 / -1; }
+
+  .empty { text-align:center; padding:34px 16px; color:var(--dim); border:1px dashed var(--line); border-radius:var(--r); }
+  .empty button { margin-top:12px; }
+
+  .seen { display:flex; flex-direction:column; gap:8px; }
+  .srow { display:flex; align-items:center; gap:14px; background:var(--card); border:1px solid var(--line);
+          border-radius:12px; padding:10px 14px; flex-wrap:wrap; }
+  .srow .nm { font-weight:600; }
+  .srow .ad { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; color:var(--acc); }
+  .srow .fm { color:var(--dim); font-size:13px; }
+  .srow button { margin-left:auto; }
+  .tag { font-size:12px; color:var(--ok); margin-left:auto; }
+
+  .savebar { position:fixed; left:50%; bottom:20px; transform:translate(-50%,140%); transition:.25s;
+             display:flex; align-items:center; gap:12px; background:#1b2430ee; backdrop-filter:blur(8px);
+             border:1px solid var(--line); border-radius:14px; padding:10px 12px 10px 18px; box-shadow:0 12px 40px #000a; }
+  .savebar.show { transform:translate(-50%,0); }
+  .savebar span { color:var(--dim); font-size:14px; white-space:nowrap; }
+
+  .toast { position:fixed; top:18px; right:18px; padding:10px 16px; border-radius:10px; background:var(--card2);
+           border:1px solid var(--line); opacity:0; transform:translateY(-8px); transition:.25s; pointer-events:none; max-width:420px; }
+  .toast.show { opacity:1; transform:none; }
+  .toast.err { border-color:var(--err); color:#ffb4ae; }
+  .toast.ok { border-color:var(--ok); }
+
+  footer { margin-top:36px; color:var(--dim); font-size:13px; }
+  footer code { background:var(--card); padding:2px 6px; border-radius:6px; }
+  @media (max-width:520px) { .grid { grid-template-columns:1fr; } .fields { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
-<h1>Récepteur VBAN</h1>
+<div class="wrap">
+  <header>
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#061423" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h2.5l2.5-6 3.5 12 3.5-9 2 3H21"/></svg></div>
+    <div>
+      <h1>Récepteur VBAN</h1>
+      <div class="sub" id="host">—</div>
+    </div>
+    <div class="pills">
+      <div class="pill"><span class="dot" id="gdot"></span><b id="nlive">0</b> en réception</div>
+      <div class="pill"><b id="nrx">0</b> récepteur(s)</div>
+    </div>
+  </header>
 
-<h2>Récepteurs</h2>
-<div class="card">
-  <table>
-    <thead><tr>
-      <th>Actif</th><th>Nom</th><th>Port</th><th>IP émettrice</th><th>Nom du flux</th>
-      <th>Sortie</th><th>Latence ms</th><th>État</th><th></th>
-    </tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div class="bar">
-    <button onclick="addRx({})">+ Récepteur</button>
-    <button class="main" onclick="apply()">Appliquer</button>
-    <span class="msg" id="msg"></span>
+  <div class="section">
+    <h2>Récepteurs</h2>
+    <button onclick="addRx({})">+ Ajouter un récepteur</button>
   </div>
-  <div class="hint">IP émettrice vide = toutes les machines. Nom du flux vide = le premier flux reçu.</div>
+  <div class="grid" id="rx"></div>
+
+  <div class="section"><h2>Flux détectés sur le réseau</h2></div>
+  <div class="seen" id="seen"></div>
+
+  <footer>
+    Dans Voicemeeter : <b>Menu → VBAN</b>, ajoute un flux sortant vers l'IP de ce PC, port <code>6980</code>, puis active-le.
+    IP émettrice vide = toutes les machines · Nom du flux vide = le premier flux reçu.
+  </footer>
 </div>
 
-<h2>Flux détectés sur les ports écoutés</h2>
-<div class="card" id="seen"></div>
+<div class="savebar" id="savebar">
+  <span>Modifications non appliquées</span>
+  <button class="ghost" onclick="load()">Annuler</button>
+  <button class="primary" id="applyBtn" onclick="apply()">Appliquer</button>
+</div>
+<div class="toast" id="toast"></div>
 
 <script>
 const $ = id => document.getElementById(id);
-let cfg = {receivers: []}, devices = [];
+let cfg = {receivers: []}, devices = [], dirty = false, seenKey = '', lastStatus = null;
 
-function field(obj, key, opts) {
-  const i = document.createElement('input');
-  if (opts.check) {
-    i.type = 'checkbox'; i.checked = obj[key];
-    i.onchange = () => obj[key] = i.checked;
-  } else {
-    i.value = obj[key]; i.placeholder = opts.ph || ''; i.style.width = opts.w;
-    if (opts.max) i.maxLength = opts.max;
-    i.oninput = () => obj[key] = opts.num ? (+i.value || 0) : i.value;
-  }
-  const td = document.createElement('td'); td.append(i); return td;
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  Object.assign(e, props || {});
+  e.append(...kids.filter(k => k != null));
+  return e;
+}
+
+function toast(text, kind) {
+  const t = $('toast');
+  t.textContent = text; t.className = 'toast show ' + (kind || '');
+  clearTimeout(toast.tm); toast.tm = setTimeout(() => t.className = 'toast', 3500);
+}
+
+function touch() { dirty = true; $('savebar').classList.add('show'); }
+
+function card(r, i) {
+  const bind = (inp, key, num) => {
+    inp.oninput = () => { r[key] = num ? (+inp.value || 0) : inp.value; touch(); };
+    return inp;
+  };
+  const fld = (label, input, wide) =>
+    h('label', {className: 'fld' + (wide ? ' wide' : '')}, h('span', {textContent: label}), input);
+
+  const sel = h('select', {onchange: () => { r.device = sel.value; touch(); }});
+  const opts = [['', 'Sortie par défaut du système'], ...devices.map(d => [d, d])];
+  if (r.device && !devices.includes(r.device)) opts.push([r.device, r.device + ' (absente)']);
+  opts.forEach(([v, t]) => sel.append(h('option', {value: v, textContent: t, selected: v === r.device})));
+
+  return h('div', {className: 'card' + (r.enabled ? '' : ' off'), id: 'card' + i},
+    h('div', {className: 'head'},
+      h('label', {className: 'switch', title: 'Activer / désactiver'},
+        h('input', {type: 'checkbox', checked: r.enabled,
+                    onchange: e => { r.enabled = e.target.checked; touch(); render(); }}),
+        h('span')),
+      bind(h('input', {className: 'title', value: r.name, maxLength: 32, placeholder: 'Nom du récepteur'}), 'name'),
+      h('button', {className: 'icon', title: 'Supprimer', textContent: '✕',
+                   onclick: () => { cfg.receivers.splice(i, 1); touch(); render(); }})),
+    h('div', {className: 'state', id: 'st' + i},
+      h('span', {className: 'dot'}),
+      h('span', {className: 'txt', textContent: dirty ? 'Non appliqué' : '…'})),
+    h('div', {className: 'meter', title: 'Niveau du signal'}, h('div', {className: 'cover', id: 'lv' + i})),
+    h('div', {className: 'fields'},
+      fld('Port UDP', bind(h('input', {value: r.port, inputMode: 'numeric', placeholder: '6980'}), 'port', true)),
+      fld('Latence (ms)', bind(h('input', {value: r.latency, inputMode: 'numeric', placeholder: '50'}), 'latency', true)),
+      fld('IP émettrice', bind(h('input', {value: r.src, placeholder: 'Toutes'}), 'src')),
+      fld('Nom du flux', bind(h('input', {value: r.stream, maxLength: 16, placeholder: 'Premier reçu'}), 'stream')),
+      fld('Sortie audio', sel, true)));
 }
 
 function render() {
-  const box = $('rows'); box.replaceChildren();
-  cfg.receivers.forEach((r, i) => {
-    const tr = document.createElement('tr');
-    const sel = document.createElement('select');
-    const opts = [['', 'Sortie par défaut'], ...devices.map(d => [d, d])];
-    if (r.device && !devices.includes(r.device)) opts.push([r.device, r.device + ' (absente)']);
-    opts.forEach(([v, t]) => {
-      const o = document.createElement('option'); o.value = v; o.textContent = t;
-      if (v === r.device) o.selected = true; sel.append(o);
-    });
-    sel.onchange = () => r.device = sel.value;
-    const tdSel = document.createElement('td'); tdSel.append(sel);
-    const tdSt = document.createElement('td');
-    tdSt.innerHTML = '<div class="st"><span class="dot"></span><span></span></div>';
-    tdSt.id = 'st' + i;
-    const del = document.createElement('button'); del.textContent = '✕';
-    del.onclick = () => { cfg.receivers.splice(i, 1); render(); };
-    const tdDel = document.createElement('td'); tdDel.append(del);
-    tr.append(
-      field(r, 'enabled', {check: true}),
-      field(r, 'name', {ph: 'Nom', w: '9em', max: 32}),
-      field(r, 'port', {ph: '6980', w: '5em', num: true}),
-      field(r, 'src', {ph: 'toutes', w: '9em'}),
-      field(r, 'stream', {ph: 'premier reçu', w: '9em', max: 16}),
-      tdSel,
-      field(r, 'latency', {w: '4em', num: true}),
-      tdSt, tdDel
-    );
-    box.append(tr);
-  });
+  const box = $('rx'); box.replaceChildren();
+  $('nrx').textContent = cfg.receivers.length;
+  if (!cfg.receivers.length) {
+    box.append(h('div', {className: 'empty', style: 'grid-column:1/-1'},
+      h('div', {textContent: 'Aucun récepteur configuré.'}),
+      h('button', {className: 'primary', textContent: '+ Ajouter un récepteur', onclick: () => addRx({})})));
+  }
+  cfg.receivers.forEach((r, i) => box.append(card(r, i)));
+  if (lastStatus) paint(lastStatus);
 }
 
 function addRx(o) {
   cfg.receivers.push(Object.assign(
     {name: 'VBAN-' + (cfg.receivers.length + 1), enabled: true, port: 6980,
      src: '', stream: '', device: '', latency: 50}, o));
-  render();
-  $('msg').textContent = 'Cliquer sur Appliquer pour activer.';
+  touch(); render();
 }
 
 async function load() {
   const r = await (await fetch('/api/config')).json();
-  cfg = r.cfg; devices = r.devices;
+  cfg = r.cfg; devices = r.devices; dirty = false;
+  $('host').textContent = r.host + ' · lecteur ' + r.backend + ' · interface port ' + location.port;
+  $('savebar').classList.remove('show');
   render(); status();
 }
 
 async function apply() {
-  $('msg').textContent = 'Application…';
+  const btn = $('applyBtn'); btn.disabled = true; btn.textContent = 'Application…';
   try {
     const res = await fetch('/api/config', {method: 'POST',
       headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg)});
     const r = await res.json();
-    if (!r.ok) { $('msg').textContent = 'Erreur : ' + (r.error || 'inconnue'); return; }
-    $('msg').textContent = 'Appliqué.';
-    load();
-  } catch (e) { $('msg').textContent = 'Erreur : ' + e; }
+    if (r.ok) { toast('Réglages appliqués', 'ok'); await load(); }
+    else toast('Erreur : ' + (r.error || 'inconnue'), 'err');
+  } catch (e) { toast('Erreur : ' + e, 'err'); }
+  btn.disabled = false; btn.textContent = 'Appliquer';
+}
+
+function paint(st) {
+  let live = 0;
+  st.receivers.forEach((s, i) => {
+    if (s.state === 'ok') live++;
+    const box = $('st' + i); if (!box || dirty) return;
+    box.querySelector('.dot').className = 'dot ' + s.state;
+    box.querySelector('.txt').textContent = s.text;
+    $('card' + i).classList.toggle('live', s.state === 'ok');
+    const lv = s.level || 0;
+    const pct = lv > 0 ? Math.max(0, Math.min(100, (20 * Math.log10(lv) + 60) / 60 * 100)) : 0;
+    $('lv' + i).style.width = (100 - pct) + '%';
+  });
+  $('nlive').textContent = live;
+  $('gdot').className = 'dot' + (live ? ' ok' : '');
+
+  const key = JSON.stringify(st.seen) + JSON.stringify(cfg.receivers);
+  if (key === seenKey) return;
+  seenKey = key;
+  const box = $('seen'); box.replaceChildren();
+  if (!st.seen.length) {
+    box.append(h('div', {className: 'empty',
+      textContent: 'Aucun flux VBAN reçu pour le moment sur les ports écoutés.'}));
+    return;
+  }
+  st.seen.forEach(s => {
+    const used = cfg.receivers.some(r => r.port === s.port && r.stream === s.stream && (!r.src || r.src === s.ip));
+    box.append(h('div', {className: 'srow'},
+      h('span', {className: 'dot ok'}),
+      h('span', {className: 'nm', textContent: s.stream || '(sans nom)'}),
+      h('span', {className: 'ad', textContent: s.ip + ':' + s.port}),
+      h('span', {className: 'fm', textContent: s.fmt}),
+      used ? h('span', {className: 'tag', textContent: '✓ Configuré'})
+           : h('button', {textContent: 'Recevoir ce flux', onclick: () => addRx({
+               name: s.stream.replace(/[^A-Za-z0-9 _.\-]/g, '_').slice(0, 32) || 'VBAN',
+               port: s.port, src: s.ip, stream: s.stream})})));
+  });
 }
 
 async function status() {
-  const st = await (await fetch('/api/status')).json();
-  st.receivers.forEach((s, i) => {
-    const td = $('st' + i); if (!td) return;
-    td.querySelector('.dot').className = 'dot ' + s.state;
-    td.querySelector('span:last-child').textContent = s.text;
-  });
-  const box = $('seen'); box.replaceChildren();
-  if (!st.seen.length) {
-    const e = document.createElement('div'); e.className = 'empty';
-    e.textContent = 'Aucun flux VBAN reçu pour le moment.'; box.append(e); return;
-  }
-  st.seen.forEach(s => {
-    const row = document.createElement('div'); row.className = 'seen';
-    const t = document.createElement('span');
-    t.textContent = s.stream + ' — ' + s.ip + ' — port ' + s.port + ' — ' + s.fmt;
-    const b = document.createElement('button'); b.textContent = 'Recevoir';
-    b.onclick = () => addRx({
-      name: (s.stream.replace(/[^A-Za-z0-9 _.\-]/g, '_').slice(0, 32) || 'VBAN'),
-      port: s.port, src: s.ip, stream: s.stream});
-    row.append(t, b); box.append(row);
-  });
+  try {
+    lastStatus = await (await fetch('/api/status')).json();
+    paint(lastStatus);
+  } catch (e) {}
 }
 
+window.onbeforeunload = () => dirty ? true : undefined;
 load();
-setInterval(status, 2000);
+setInterval(status, 400);
 </script>
 </body>
 </html>
@@ -545,7 +707,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self._send(200, PAGE, "text/html")
         elif self.path == "/api/config":
-            self._send(200, json.dumps({"cfg": self.manager.cfg, "devices": list_devices()}))
+            self._send(200, json.dumps({
+                "cfg": self.manager.cfg, "devices": list_devices(),
+                "host": socket.gethostname(), "backend": BACKEND,
+            }))
         elif self.path == "/api/status":
             self._send(200, json.dumps(self.manager.status()))
         else:
